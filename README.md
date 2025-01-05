@@ -51,7 +51,7 @@ OTHER_CONFIG=value
 
 1. Start the web application:
 ```bash
-python app.py
+streamlit run app.py
 ```
 
 2. Access the web interface at `http://localhost:5000`
