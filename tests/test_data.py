@@ -1,56 +1,47 @@
-from types import SimpleNamespace
-
 import pandas as pd
 import pytest
 
-import utils
-
-HOUR_MS = 3_600_000
-
-
-class FakeExchange:
-    """Serves hourly candles up to and including the one currently forming."""
-    page = 500
-
-    def __init__(self, config):
-        now_ms = int(pd.Timestamp.now(tz="UTC").timestamp() * 1000)
-        self.forming = now_ms - now_ms % HOUR_MS
-        self.calls = 0
-
-    def fetch_ohlcv(self, symbol, timeframe, since=None):
-        self.calls += 1
-        start = since - since % HOUR_MS
-        if self.calls > 1:
-            start -= HOUR_MS  # overlap the previous page by one bar, as some exchanges do
-        stamps = list(range(start, self.forming + 1, HOUR_MS))[: self.page]
-        return [[t, 1.0, 2.0, 0.5, 1.5, 10.0] for t in stamps]
+from conftest import FakeExchange, make_bars
+from trader import data
 
 
-@pytest.fixture
-def fake_ccxt(monkeypatch):
-    monkeypatch.setattr(utils, "ccxt", SimpleNamespace(binance=FakeExchange))
+def test_fetch_paginates_and_drops_the_forming_bar():
+    bars = make_bars(2000)
+    now = bars.index[1500] + pd.Timedelta(minutes=20)      # bar 1500 is still forming
+    ex = FakeExchange(bars, now, page=300)
+    got = data.fetch_bars(ex, "BTC/USDT", "1h", bars.index[0].to_pydatetime(), now.to_pydatetime())
+    assert ex.ohlcv_calls > 1
+    assert got.index[-1] == bars.index[1499]
+    pd.testing.assert_frame_equal(got, bars.iloc[:1500], check_freq=False, check_index_type=False)
 
 
-def test_paginates_and_drops_forming_bar(fake_ccxt):
-    df = utils.get_crypto_data("BTC/USDT", period="60d", interval="1h")
-    assert str(df.index.tz) == "UTC"
-    assert df.index.is_monotonic_increasing and not df.index.has_duplicates
-    assert len(df) >= 60 * 24 - 1
-    assert df.index[-1] + pd.Timedelta(hours=1) <= pd.Timestamp.now(tz="UTC")
-    assert list(df.columns) == ["Open", "High", "Low", "Close", "Volume"]
-
-
-def test_refuses_oversized_downloads(fake_ccxt):
+def test_fetch_refuses_oversized_downloads():
+    bars = make_bars(2000)
+    ex = FakeExchange(bars, bars.index[-1], page=500)
     with pytest.raises(ValueError, match="bars"):
-        utils.get_crypto_data("BTC/USDT", period="1y", interval="1h", max_bars=1000)
+        data.fetch_bars(ex, "BTC/USDT", "1h", bars.index[0].to_pydatetime(), bars.index[-1].to_pydatetime(), max_bars=600)
 
 
-def test_rejects_unknown_interval(fake_ccxt):
+def test_load_bars_caches_and_extends(tmp_path, monkeypatch):
+    now = pd.Timestamp.now(tz="UTC").floor("h")
+    bars = make_bars(24 * 40, start=str(now - pd.Timedelta(hours=24 * 40 - 1)))
+    ex = FakeExchange(bars, now - pd.Timedelta(days=5))
+    monkeypatch.setattr(data, "make_exchange", lambda name: ex)
+
+    first = data.load_bars("binance", "BTC/USDT", "1h", days=30, cache_dir=tmp_path)
+    assert (tmp_path / "binance" / "BTC-USDT_1h.csv").exists()
+
+    ex.now = now + pd.Timedelta(minutes=30)
+    calls = ex.ohlcv_calls
+    second = data.load_bars("binance", "BTC/USDT", "1h", days=30, cache_dir=tmp_path)
+    assert ex.ohlcv_calls - calls == 1                          # only the new bars were fetched
+    assert second.index[-1] > first.index[-1]
+    assert second.index.is_monotonic_increasing and not second.index.has_duplicates
+    assert str(second.index.tz) == "UTC"
+
+
+def test_intervals():
+    assert data.periods_per_year("1h") == 365 * 24
+    assert data.periods_per_year("1d") == 365
     with pytest.raises(ValueError):
-        utils.get_crypto_data("BTC/USDT", interval="3h")
-
-
-def test_bars_per_day():
-    assert utils.bars_per_day("1h") == 24
-    assert utils.bars_per_day("4h") == 6
-    assert utils.bars_per_day("1d") == 1
+        data.bar_minutes("3h")

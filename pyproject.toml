@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trader"
+version = "0.1.0"
+description = "Crypto signals from TypeSafe Jev, validated by walk-forward backtests before paper trading"
+requires-python = ">=3.11"
+dependencies = [
+    "ccxt>=4.4",
+    "numpy>=1.26",
+    "pandas>=2.2",
+    "scipy>=1.11",
+    "typesafe-sdk>=0.7.2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+trader = "trader.cli:main"
+
+[tool.setuptools]
+packages = ["trader"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
