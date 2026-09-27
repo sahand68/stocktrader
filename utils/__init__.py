@@ -1,101 +1,101 @@
 from .plotting import *
 
-from polygon import RESTClient
+import ccxt
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import logging
-import os
-from typing import Optional
-import dotenv
 
-# Load environment variables
-dotenv.load_dotenv()
+# Bar length in minutes for every interval the app offers.
+TIMEFRAME_MINUTES = {
+    "1m": 1,
+    "5m": 5,
+    "15m": 15,
+    "30m": 30,
+    "1h": 60,
+    "4h": 240,
+    "1d": 1440,
+    "1w": 10080,
+}
 
-def get_stock_data(ticker: str, period: str = "1y", interval: str = "1d") -> pd.DataFrame:
+
+def bars_per_day(interval: str) -> float:
+    """Crypto trades 24/7, so a day is always 1440 minutes."""
+    return 1440 / TIMEFRAME_MINUTES[interval]
+
+
+def period_start(period: str, now: datetime) -> datetime:
+    """Convert a period string ("5d", "3mo", "2y", "ytd", "max") to a UTC start time."""
+    if period == "max":
+        return datetime(2010, 1, 1, tzinfo=timezone.utc)
+    if period == "ytd":
+        return datetime(now.year, 1, 1, tzinfo=timezone.utc)
+    if period.endswith("mo"):
+        return now - timedelta(days=int(period[:-2]) * 30)
+    if period.endswith("d"):
+        return now - timedelta(days=int(period[:-1]))
+    if period.endswith("y"):
+        return now - timedelta(days=int(period[:-1]) * 365)
+    raise ValueError(f"Unsupported period: {period}")
+
+
+def get_crypto_data(
+    symbol: str,
+    period: str = "1y",
+    interval: str = "1h",
+    exchange: str = "binance",
+    max_bars: int = 100_000,
+) -> pd.DataFrame:
     """
-    Fetch stock data from Polygon.io API.
-    
+    Fetch closed OHLCV bars from a public exchange endpoint (no API key needed).
+
     Args:
-        ticker: Stock symbol
-        period: Time period (e.g., "1d", "5d", "1mo", "3mo", "6mo", "1y", "2y", "5y")
-        interval: Time interval ("1m", "5m", "15m", "30m", "1h", "1d")
+        symbol: Market symbol in ccxt format, e.g. "BTC/USDT"
+        period: Lookback ("1d", "5d", "1mo", "3mo", "6mo", "ytd", "1y", "2y", "5y", "max")
+        interval: Bar size, one of TIMEFRAME_MINUTES
+        exchange: ccxt exchange id, e.g. "binance", "coinbaseexchange", "okx"
+        max_bars: Refuse to download more than this many bars
+
+    Returns:
+        DataFrame indexed by bar open time (UTC) with Open, High, Low, Close, Volume.
     """
-    try:
-        api_key = os.getenv('POLYGON_API_KEY')
-        if not api_key:
-            raise ValueError("POLYGON_API_KEY environment variable not set")
-        
-        client = RESTClient(api_key)
-        
-        # Convert period to start date
-        end_date = datetime.now()
-        if period.endswith('d'):
-            days = int(period[:-1])
-            start_date = end_date - timedelta(days=days)
-        elif period.endswith('mo'):
-            months = int(period[:-2])
-            start_date = end_date - timedelta(days=months * 30)
-        elif period.endswith('y'):
-            years = int(period[:-1])
-            start_date = end_date - timedelta(days=years * 365)
-        else:
-            start_date = end_date - timedelta(days=365)  # Default to 1 year
-        
-        # Convert interval to Polygon timespan
-        timespan_map = {
-            "1m": "minute",
-            "5m": "minute",
-            "15m": "minute",
-            "30m": "minute",
-            "1h": "hour",
-            "1d": "day"
-        }
-        
-        multiplier_map = {
-            "1m": 1,
-            "5m": 5,
-            "15m": 15,
-            "30m": 30,
-            "1h": 1,
-            "1d": 1
-        }
-        
-        timespan = timespan_map.get(interval, "day")
-        multiplier = multiplier_map.get(interval, 1)
-        
-        # Fetch data from Polygon
-        aggs = []
-        for a in client.list_aggs(
-            ticker=ticker,
-            multiplier=multiplier,
-            timespan=timespan,
-            from_=start_date.strftime("%Y-%m-%d"),
-            to=end_date.strftime("%Y-%m-%d"),
-            limit=50000
-        ):
-            aggs.append({
-                'timestamp': pd.Timestamp(a.timestamp, unit='ms'),
-                'Open': a.open,
-                'High': a.high,
-                'Low': a.low,
-                'Close': a.close,
-                'Volume': a.volume
-            })
-        
-        if not aggs:
-            logging.warning(f"No data found for {ticker}")
-            return pd.DataFrame()
-        
-        df = pd.DataFrame(aggs)
-        df.set_index('timestamp', inplace=True)
-        df.sort_index(inplace=True)
-        
-        return df
-        
-    except Exception as e:
-        logging.error(f"Error fetching data for {ticker}: {str(e)}")
+    if interval not in TIMEFRAME_MINUTES:
+        raise ValueError(f"Unsupported interval: {interval}")
+
+    client = getattr(ccxt, exchange)({"enableRateLimit": True})
+    bar_ms = TIMEFRAME_MINUTES[interval] * 60_000
+    now = datetime.now(timezone.utc)
+    now_ms = int(now.timestamp() * 1000)
+    since = int(period_start(period, now).timestamp() * 1000)
+
+    rows = []
+    while since < now_ms:
+        batch = client.fetch_ohlcv(symbol, interval, since=since)
+        if not batch:
+            break
+        rows.extend(batch)
+        if len(rows) > max_bars:
+            raise ValueError(
+                f"{symbol} {interval} over {period} is more than {max_bars:,} bars; "
+                "pick a larger interval or a shorter period"
+            )
+        next_since = batch[-1][0] + bar_ms
+        if next_since <= since:
+            break
+        since = next_since
+
+    if not rows:
+        logging.warning(f"No data found for {symbol} on {exchange}")
         return pd.DataFrame()
+
+    df = pd.DataFrame(rows, columns=["timestamp", "Open", "High", "Low", "Close", "Volume"])
+    df = df.drop_duplicates("timestamp").sort_values("timestamp")
+    df.index = pd.to_datetime(df.pop("timestamp"), unit="ms", utc=True)
+    df.index.name = "timestamp"
+
+    # The newest bar is usually still forming; its close would change after we act on it.
+    df = df[df.index + pd.Timedelta(milliseconds=bar_ms) <= pd.Timestamp(now)]
+    return df.astype(float)
 
 def add_technical_indicators(df):
     """Add technical indicators to the dataframe."""

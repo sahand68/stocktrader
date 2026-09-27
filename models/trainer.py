@@ -82,7 +82,37 @@ class ModelTrainer:
         # Initialize feature columns for main stock
         self.feature_cols = self.base_features.copy()
 
-    def _prepare_sequences_for_dual_task(self, df):
+    @staticmethod
+    def _train_rows(n_rows, train_ratio, sequence_length):
+        """
+        Number of leading rows that feed the training split. The last row has no
+        target and is dropped; each sequence ends one row before the row it labels.
+        """
+        n_samples = n_rows - 1 - sequence_length
+        return sequence_length + int(train_ratio * n_samples) - 1
+
+    def _fit_scaler(self, train_values):
+        """
+        Robust min/max from the training rows only. Fitting on the full series would
+        leak the validation period's price range into training.
+        """
+        self.f_min = np.percentile(train_values, 1, axis=0)
+        self.f_max = np.percentile(train_values, 99, axis=0)
+
+        # Ensure no zero ranges
+        range_mask = (self.f_max - self.f_min) < 1e-8
+        if range_mask.any():
+            logger.warning(f"Features with too small range: {[i for i, small in enumerate(range_mask) if small]}")
+            for i in np.where(range_mask)[0]:
+                abs_max = np.abs(train_values[:, i]).max()
+                if abs_max < 1e-8:
+                    self.f_min[i] = -0.001
+                    self.f_max[i] = 0.001
+                else:
+                    self.f_min[i] = -abs_max
+                    self.f_max[i] = abs_max
+
+    def _prepare_sequences_for_dual_task(self, df, train_ratio=0.8):
         """Prepares sequences for predicting next day's average price and sentiment."""
         logger.info(f"Initial data shape: {df.shape}")
         
@@ -119,22 +149,8 @@ class ModelTrainer:
         
         # Normalize the data with robust scaling
         data_values = df[self.feature_cols].values
-        self.f_min = np.percentile(data_values, 1, axis=0)
-        self.f_max = np.percentile(data_values, 99, axis=0)
-        
-        # Ensure no zero ranges
-        range_mask = (self.f_max - self.f_min) < 1e-8
-        if range_mask.any():
-            logger.warning(f"Features with too small range: {[self.feature_cols[i] for i, small in enumerate(range_mask) if small]}")
-            for i in np.where(range_mask)[0]:
-                abs_max = np.abs(data_values[:, i]).max()
-                if abs_max < 1e-8:
-                    self.f_min[i] = -0.001
-                    self.f_max[i] = 0.001
-                else:
-                    self.f_min[i] = -abs_max
-                    self.f_max[i] = abs_max
-        
+        self._fit_scaler(data_values[:self._train_rows(len(data_values), train_ratio, self.sequence_length)])
+
         # Scale the data
         eps = 1e-8
         data_scaled = np.clip((data_values - self.f_min) / (self.f_max - self.f_min + eps), -10, 10)
@@ -241,7 +257,7 @@ class ModelTrainer:
         ts_val = timestamps[split_idx:]
         return X_train, y_avg_price_train, y_sentiment_train, X_val, y_avg_price_val, y_sentiment_val, ts_train, ts_val
 
-    def _prepare_sequences_with_related_stocks(self, main_df):
+    def _prepare_sequences_with_related_stocks(self, main_df, train_ratio=0.8):
         """Prepares sequences including related stocks data as features."""
         logger.info(f"Initial main data shape: {main_df.shape}")
         
@@ -303,22 +319,8 @@ class ModelTrainer:
         data_values = np.concatenate(combined_features, axis=1)
         
         # Normalize the combined data
-        self.f_min = np.percentile(data_values, 1, axis=0)
-        self.f_max = np.percentile(data_values, 99, axis=0)
-        
-        # Handle zero ranges
-        range_mask = (self.f_max - self.f_min) < 1e-8
-        if range_mask.any():
-            logger.warning(f"Features with too small range: {[self.feature_cols[i] for i, small in enumerate(range_mask) if small]}")
-            for i in np.where(range_mask)[0]:
-                abs_max = np.abs(data_values[:, i]).max()
-                if abs_max < 1e-8:
-                    self.f_min[i] = -0.001
-                    self.f_max[i] = 0.001
-                else:
-                    self.f_min[i] = -abs_max
-                    self.f_max[i] = abs_max
-        
+        self._fit_scaler(data_values[:self._train_rows(len(data_values), train_ratio, self.sequence_length)])
+
         # Scale the data
         eps = 1e-8
         data_scaled = np.clip((data_values - self.f_min) / (self.f_max - self.f_min + eps), -10, 10)
@@ -415,10 +417,10 @@ class ModelTrainer:
         if self.model_type == 'lstm_attention':
             if self.related_dfs:
                 # Prepare sequences with related stocks data
-                X, y_returns, y_sentiment, timestamps = self._prepare_sequences_with_related_stocks(df)
+                X, y_returns, y_sentiment, timestamps = self._prepare_sequences_with_related_stocks(df, train_ratio)
             else:
                 # Use original preparation method for single stock
-                X, y_returns, y_sentiment, timestamps = self._prepare_sequences_for_dual_task(df)
+                X, y_returns, y_sentiment, timestamps = self._prepare_sequences_for_dual_task(df, train_ratio)
             
             # Split the data
             split_data = self._time_based_split_dual_task(
@@ -712,15 +714,14 @@ class ModelTrainer:
                 delta = timedelta(hours=int(self.interval[:-1]))
             elif self.interval.endswith('d'):
                 delta = timedelta(days=int(self.interval[:-1]))
+            elif self.interval.endswith('w'):
+                delta = timedelta(weeks=int(self.interval[:-1]))
             else:
                 raise ValueError(f"Unsupported interval format: {self.interval}")
 
             current_timestamp = last_timestamp
             for _ in range(self.forecast_days):
-                while True:
-                    current_timestamp += delta
-                    if current_timestamp.weekday() < 5:  # Skip weekends
-                        break
+                current_timestamp += delta
                 future_timestamps.append(current_timestamp)
 
             predictions = []
@@ -844,22 +845,8 @@ class ModelTrainer:
         
         # Normalize the data
         data_values = df[feature_cols].values
-        self.f_min = np.percentile(data_values, 1, axis=0)
-        self.f_max = np.percentile(data_values, 99, axis=0)
-        
-        # Handle zero ranges
-        range_mask = (self.f_max - self.f_min) < 1e-8
-        if range_mask.any():
-            logger.warning(f"Features with too small range: {[feature_cols[i] for i, small in enumerate(range_mask) if small]}")
-            for i in np.where(range_mask)[0]:
-                abs_max = np.abs(data_values[:, i]).max()
-                if abs_max < 1e-8:
-                    self.f_min[i] = -0.001
-                    self.f_max[i] = 0.001
-                else:
-                    self.f_min[i] = -abs_max
-                    self.f_max[i] = abs_max
-        
+        self._fit_scaler(data_values[:self._train_rows(len(data_values), train_ratio, 0)])
+
         # Scale the data
         eps = 1e-8
         data_scaled = np.clip((data_values - self.f_min) / (self.f_max - self.f_min + eps), -10, 10)

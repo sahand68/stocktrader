@@ -20,33 +20,19 @@ def get_device_with_memory_check():
 
 def calculate_trading_steps(interval, forecast_days):
     """
-    Calculate the number of trading steps based on interval and forecast days
-    :param interval: Trading interval (e.g., "1m", "5m", "15m", "30m", "1h", "1d")
+    Calculate the number of bars in a forecast horizon
+    :param interval: Bar size (e.g., "1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w")
     :param forecast_days: Number of days to forecast
-    :return: Number of trading steps
+    :return: Number of bars, at least 1
     """
-    # For intraday intervals, calculate steps based on trading hours (assuming 6.5 hours per day)
-    trading_hours_per_day = 6.5
-    minutes_per_day = trading_hours_per_day * 60
-    
-    steps_map = {
-        "1m": minutes_per_day,
-        "5m": minutes_per_day / 5,
-        "15m": minutes_per_day / 15,
-        "30m": minutes_per_day / 30,
-        "1h": trading_hours_per_day,
-        "1d": 1,
-        "5d": 1/5,
-        "1wk": 1/7,
-        "1mo": 1/30
-    }
-    
-    if interval not in steps_map:
+    from utils import TIMEFRAME_MINUTES
+
+    if interval not in TIMEFRAME_MINUTES:
         raise ValueError(f"Unsupported interval: {interval}")
-    
-    # Calculate total steps
-    steps = int(forecast_days * steps_map[interval])
-    return max(1, steps)  # Ensure at least 1 step
+
+    # Crypto trades around the clock: every day has 1440 minutes of bars.
+    steps = int(forecast_days * 1440 / TIMEFRAME_MINUTES[interval])
+    return max(1, steps)
 
 def get_bullish_bearish_confidence(current_price, predicted_price, model_mse):
     """

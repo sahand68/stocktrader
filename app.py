@@ -1,8 +1,7 @@
 import streamlit as st
-import os
-from dotenv import load_dotenv
 from utils import (
-    get_stock_data,
+    get_crypto_data,
+    bars_per_day,
     add_technical_indicators,
     find_support_resistance_levels,
     determine_trend
@@ -10,15 +9,16 @@ from utils import (
 from utils.plotting import create_candlestick_plot, create_prediction_figure
 from models.trainer import ModelTrainer
 from models.utils import get_bullish_bearish_confidence
+from backtest.engine import Config, periods_per_year
+from backtest.risk import losing_streak_drawdown, position_size
+from backtest.strategies import STRATEGIES
+from backtest.validate import validate
 from datetime import datetime, timedelta
 import pandas as pd
 import numpy as np
 import logging
 import io
 import plotly.graph_objects as go
-
-# Load environment variables
-load_dotenv()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -32,18 +32,19 @@ formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(messag
 log_handler.setFormatter(formatter)
 logging.getLogger().addHandler(log_handler)
 
-st.set_page_config(page_title="Stock Analysis App", layout="wide")
+st.set_page_config(page_title="Crypto Analysis App", layout="wide")
 
-# Check for API key
-if not os.getenv('POLYGON_API_KEY'):
-    st.error("Please set your Polygon API key in the .env file as POLYGON_API_KEY")
-    st.stop()
+
+def fmt_price(x):
+    """Dollar price with enough digits for sub-cent coins."""
+    return f"${x:,.2f}" if abs(x) >= 1 else f"${x:.6g}"
+
 
 # Title and description
-st.title("📈 Stock Analysis App")
+st.title("📈 Crypto Analysis App")
 st.markdown("""
-This app performs real-time stock analysis using technical indicators and ML models.
-Enter a stock ticker and select your preferred timeframe to get started!
+Technical analysis, ML forecasts and walk-forward backtests on crypto markets.
+Data comes from public exchange endpoints, so no API key is needed.
 """)
 
 # Sidebar inputs
@@ -52,11 +53,15 @@ st.sidebar.header("Input Parameters")
 # Analysis mode selection
 analysis_mode = st.sidebar.radio(
     "Select Analysis Mode",
-    ["Technical Analysis", "ML Forecast", "Both"]
+    ["Technical Analysis", "ML Forecast", "Both", "Backtest"]
 )
 
-# Stock ticker input
-ticker = st.sidebar.text_input("Stock Ticker", value="AAPL").upper()
+exchange = st.sidebar.selectbox(
+    "Exchange",
+    ["binance", "binanceus", "coinbaseexchange", "okx", "bybit"],
+    help="binance.com is geo-blocked in some countries (including the US); use binanceus or coinbaseexchange there."
+)
+ticker = st.sidebar.text_input("Symbol", value="BTC/USDT", help="Exchange symbol, e.g. BTC/USDT or ETH/USD").upper()
 
 # Time period selection
 period_options = {
@@ -85,7 +90,7 @@ if selected_period in ["1 Day", "5 Days"]:
     interval_options = ["1m", "5m", "15m", "30m", "1h"]
     default_interval = "5m"
 else:
-    interval_options = ["1m", "5m", "15m", "30m", "1h", "1d", "5d", "1wk", "1mo"]
+    interval_options = ["1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"]
     default_interval = "1h"
 
 interval = st.sidebar.selectbox(
@@ -109,6 +114,21 @@ if analysis_mode in ["ML Forecast", "Both"]:
         "Forecast Horizon",
         [1, 3],
         format_func=lambda x: f"{x} Day{'s' if x > 1 else ''} Ahead"
+    )
+
+if analysis_mode == "Backtest":
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### Backtest Settings")
+    strategy_name = st.sidebar.selectbox("Strategy", list(STRATEGIES))
+    allow_short = st.sidebar.checkbox("Allow shorts", value=False)
+    fee_bps = st.sidebar.number_input("Fee per side (bps)", min_value=0.0, value=10.0, step=1.0)
+    slippage_bps = st.sidebar.number_input("Slippage per side (bps)", min_value=0.0, value=5.0, step=1.0)
+    train_days = st.sidebar.number_input("Train window (days)", min_value=7, value=180, step=10)
+    test_days = st.sidebar.number_input("Test window (days)", min_value=1, value=30, step=5)
+    prior_trials = st.sidebar.number_input(
+        "Variations tried before this session", min_value=0, value=0, step=1,
+        help="Every strategy, parameter or setting you have already looked at on this data. "
+             "Understating it only fools you."
     )
 
 # Add date range info
@@ -144,26 +164,104 @@ elif period == "10y":
 st.sidebar.markdown(f"**Time Range:** {date_info}")
 st.sidebar.markdown(f"**Current Date:** {end_date}")
 
-if st.sidebar.button("Analyze Stock"):
+
+def render_backtest(df):
+    """Walk-forward backtest with the three gates: critic, deflated Sharpe, walk-forward."""
+    cfg = Config(fee_bps=fee_bps, slippage_bps=slippage_bps, periods_per_year=periods_per_year(interval))
+    strategy = STRATEGIES[strategy_name](allow_short=allow_short)
+    train_bars = int(train_days * bars_per_day(interval))
+    test_bars = int(test_days * bars_per_day(interval))
+
+    # Every distinct configuration looked at this session counts as a trial.
+    tried = st.session_state.setdefault("tried_configs", set())
+    tried.add((exchange, ticker, interval, period, strategy_name, allow_short,
+               fee_bps, slippage_bps, train_days, test_days))
+    n_trials = int(prior_trials) + len(tried)
+
+    with st.spinner(f"Walk-forward testing {strategy_name}..."):
+        report = validate(df, strategy, cfg, interval, train_bars, test_bars, n_trials)
+
+    wf = report.walk_forward
+    m = report.oos_metrics
+
+    st.subheader(f"{strategy_name}: {'APPROVED' if report.approved else 'REJECTED'}")
+    for gate, passed in report.gates.items():
+        (st.success if passed else st.error)(f"{'✅' if passed else '❌'} {gate}")
+
+    cols = st.columns(5)
+    cols[0].metric("OOS Sharpe", f"{m['sharpe']:.2f}")
+    cols[1].metric("CAGR", f"{m['cagr']:.1%}")
+    cols[2].metric("Max drawdown", f"{m['max_drawdown']:.1%}")
+    cols[3].metric("Longest drawdown", f"{m['longest_dd_days']:.0f} days")
+    cols[4].metric("Positive folds", f"{wf.positive_folds}/{len(wf.folds)}")
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=wf.oos.index, y=wf.oos["equity"], name="Strategy (after costs)"))
+    oos_close = df["Close"].loc[wf.oos.index]
+    fig.add_trace(go.Scatter(x=oos_close.index, y=cfg.initial_capital * oos_close / oos_close.iloc[0],
+                             name="Buy and hold", line=dict(dash="dot")))
+    for start in wf.folds["start"]:
+        fig.add_vline(x=start, line_width=1, line_dash="dot", opacity=0.3)
+    fig.update_layout(title="Out-of-sample equity (dotted lines mark fold starts)",
+                      yaxis_title="Equity ($)", hovermode="x unified")
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.subheader("Multiple-testing correction")
+    dsr = report.dsr
+    dcols = st.columns(3)
+    dcols[0].metric("Deflated Sharpe probability", f"{dsr.probability:.3f}")
+    dcols[1].metric("Best-of-noise Sharpe", f"{dsr.noise_benchmark:.2f}")
+    dcols[2].metric("Trials counted", dsr.n_trials)
+    st.caption("Probability that the true Sharpe beats what the best of this many random strategies would show. "
+               "Needs to exceed 0.95.")
+
+    st.subheader("Critic")
+    st.dataframe(pd.DataFrame([vars(c) for c in report.checks]), use_container_width=True, hide_index=True)
+
+    st.subheader("Walk-forward folds")
+    st.caption("Judge on the worst fold and the share of positive folds, not the average.")
+    st.dataframe(wf.folds, use_container_width=True, hide_index=True)
+
+    st.subheader("By market regime (200-bar moving average)")
+    st.dataframe(report.regimes, use_container_width=True)
+
+
+def render_position_sizer():
+    st.markdown("---")
+    st.subheader("Position sizing")
+    st.caption("Size for the path: a real edge still kills an account that bets too much per trade.")
+    cols = st.columns(4)
+    capital = cols[0].number_input("Capital ($)", min_value=1.0, value=10_000.0)
+    entry = cols[1].number_input("Entry price", min_value=0.0, value=100.0, format="%.6g")
+    stop = cols[2].number_input("Stop price", min_value=0.0, value=95.0, format="%.6g")
+    risk_pct = cols[3].number_input("Risk per trade (%)", min_value=0.1, max_value=10.0, value=1.0) / 100
+    if entry > 0 and entry != stop:
+        size = position_size(capital, entry, stop, risk_pct)
+        st.write(f"Buy **{size['units']:.6g}** units ({fmt_price(size['notional'])}, "
+                 f"{size['pct_of_capital']:.1%} of capital); a stop-out loses {fmt_price(size['loss_if_stopped'])}.")
+    st.write(f"Twelve losses in a row at this risk: **{losing_streak_drawdown(risk_pct, 12):.1%}** drawdown.")
+
+
+if st.sidebar.button("Analyze"):
     try:
         # Clear previous logs
         log_buffer.truncate(0)
         log_buffer.seek(0)
         
-        with st.spinner('Fetching stock data...'):
-            logger.info(f"Starting analysis for {ticker}")
+        with st.spinner('Fetching market data...'):
+            logger.info(f"Starting analysis for {ticker} on {exchange}")
             
-            # Get stock data first
-            logger.info(f"Fetching stock data with period={period} and interval={interval}")
-            df = get_stock_data(ticker, period, interval)
+            # Get market data first
+            logger.info(f"Fetching market data with period={period} and interval={interval}")
+            df = get_crypto_data(ticker, period, interval, exchange)
             
             if df.empty:
                 logger.error("No data available")
-                st.error(f"No data available for {ticker} with the selected period and interval. Try a different interval.")
+                st.error(f"No data available for {ticker} on {exchange} with the selected period and interval.")
             else:
                 logger.info(f"Successfully fetched {len(df)} rows of data")
                 
-                # Show basic stock info
+                # Show basic market info
                 st.subheader(f"{ticker} Analysis")
                 
                 # Calculate basic metrics
@@ -177,15 +275,15 @@ if st.sidebar.button("Analyze Stock"):
                 with col1:
                     st.metric(
                         "Current Price",
-                        f"${current_price:.2f}",
+                        fmt_price(current_price),
                         f"{price_change:+.2f}%"
                     )
                 with col2:
                     high_price = df['High'].max()
-                    st.metric("Period High", f"${high_price:.2f}")
+                    st.metric("Period High", fmt_price(high_price))
                 with col3:
                     low_price = df['Low'].min()
-                    st.metric("Period Low", f"${low_price:.2f}")
+                    st.metric("Period Low", fmt_price(low_price))
 
                 # Add technical indicators if needed
                 if analysis_mode in ["Technical Analysis", "Both"]:
@@ -195,7 +293,7 @@ if st.sidebar.button("Analyze Stock"):
                 if analysis_mode == "Technical Analysis":
                     # Single column layout for technical analysis
                     # Display candlestick chart
-                    st.subheader("Interactive Stock Chart")
+                    st.subheader("Interactive Price Chart")
                     fig = create_candlestick_plot(df, ticker)
                     st.plotly_chart(fig, use_container_width=True)
                     
@@ -221,10 +319,10 @@ if st.sidebar.button("Analyze Stock"):
                     if support_levels or resistance_levels:
                         st.subheader("Support Levels")
                         for i, level in enumerate(support_levels[-3:], 1):
-                            st.metric(f"Support Level {i}", f"${level:.2f}")
+                            st.metric(f"Support Level {i}", fmt_price(level))
                         st.subheader("Resistance Levels")
                         for i, level in enumerate(resistance_levels[-3:], 1):
-                            st.metric(f"Resistance Level {i}", f"${level:.2f}")
+                            st.metric(f"Resistance Level {i}", fmt_price(level))
                     else:
                         st.write("No support/resistance levels found in the current timeframe.")
                     
@@ -232,11 +330,11 @@ if st.sidebar.button("Analyze Stock"):
                     with st.expander("Additional Technical Metrics"):
                         metrics_col1, metrics_col2 = st.columns(2)
                         with metrics_col1:
-                            st.metric("SMA (20)", f"${df['SMA_20'].iloc[-1]:.2f}")
-                            st.metric("Bollinger Upper", f"${df['BB_upper'].iloc[-1]:.2f}")
+                            st.metric("SMA (20)", fmt_price(df['SMA_20'].iloc[-1]))
+                            st.metric("Bollinger Upper", fmt_price(df['BB_upper'].iloc[-1]))
                         with metrics_col2:
-                            st.metric("EMA (20)", f"${df['EMA_20'].iloc[-1]:.2f}")
-                            st.metric("Bollinger Lower", f"${df['BB_lower'].iloc[-1]:.2f}")
+                            st.metric("EMA (20)", fmt_price(df['EMA_20'].iloc[-1]))
+                            st.metric("Bollinger Lower", fmt_price(df['BB_lower'].iloc[-1]))
                 
                 elif analysis_mode == "ML Forecast":
                     # Single column layout for ML forecast
@@ -244,7 +342,7 @@ if st.sidebar.button("Analyze Stock"):
                     df = add_technical_indicators(df)
                     
                     # Display candlestick chart
-                    st.subheader("Interactive Stock Chart")
+                    st.subheader("Interactive Price Chart")
                     fig = create_candlestick_plot(df, ticker)
                     st.plotly_chart(fig, use_container_width=True)
                     
@@ -289,7 +387,7 @@ if st.sidebar.button("Analyze Stock"):
                             with pred_cols[0]:
                                 st.metric(
                                     f"Final Predicted Price ({forecast_days}d)",
-                                    f"${final_price:.2f}",
+                                    fmt_price(final_price),
                                     f"{pred_change:+.2f}%"
                                 )
                                 mse_display = f"{val_mse:.4f}" if val_mse is not None else "N/A"
@@ -320,6 +418,9 @@ if st.sidebar.button("Analyze Stock"):
                             logger.error(f"Error in ML prediction: {str(model_error)}", exc_info=True)
                             st.error(f"Error in ML prediction: {str(model_error)}")
                 
+                elif analysis_mode == "Backtest":
+                    render_backtest(df)
+
                 else:  # Both
                     # Add technical indicators
                     df = add_technical_indicators(df)
@@ -329,7 +430,7 @@ if st.sidebar.button("Analyze Stock"):
                     
                     with chart_col:
                         # Display candlestick chart
-                        st.subheader("Interactive Stock Chart")
+                        st.subheader("Interactive Price Chart")
                         fig = create_candlestick_plot(df, ticker)
                         st.plotly_chart(fig, use_container_width=True)
                     
@@ -355,10 +456,10 @@ if st.sidebar.button("Analyze Stock"):
                         if support_levels or resistance_levels:
                             st.subheader("Support Levels")
                             for i, level in enumerate(support_levels[-3:], 1):
-                                st.metric(f"Support Level {i}", f"${level:.2f}")
+                                st.metric(f"Support Level {i}", fmt_price(level))
                             st.subheader("Resistance Levels")
                             for i, level in enumerate(resistance_levels[-3:], 1):
-                                st.metric(f"Resistance Level {i}", f"${level:.2f}")
+                                st.metric(f"Resistance Level {i}", fmt_price(level))
                         else:
                             st.write("No support/resistance levels found in the current timeframe.")
                         
@@ -404,7 +505,7 @@ if st.sidebar.button("Analyze Stock"):
                                 with pred_cols[0]:
                                     st.metric(
                                         f"Final Predicted Price ({forecast_days}d)",
-                                        f"${final_price:.2f}",
+                                        fmt_price(final_price),
                                         f"{pred_change:+.2f}%"
                                     )
                                     mse_display = f"{val_mse:.4f}" if val_mse is not None else "N/A"
@@ -437,12 +538,12 @@ if st.sidebar.button("Analyze Stock"):
                             metrics_col1, metrics_col2 = st.columns(2)
                             
                             with metrics_col1:
-                                st.metric("SMA (20)", f"${df['SMA_20'].iloc[-1]:.2f}")
-                                st.metric("Bollinger Upper", f"${df['BB_upper'].iloc[-1]:.2f}")
+                                st.metric("SMA (20)", fmt_price(df['SMA_20'].iloc[-1]))
+                                st.metric("Bollinger Upper", fmt_price(df['BB_upper'].iloc[-1]))
                             
                             with metrics_col2:
-                                st.metric("EMA (20)", f"${df['EMA_20'].iloc[-1]:.2f}")
-                                st.metric("Bollinger Lower", f"${df['BB_lower'].iloc[-1]:.2f}")
+                                st.metric("EMA (20)", fmt_price(df['EMA_20'].iloc[-1]))
+                                st.metric("Bollinger Lower", fmt_price(df['BB_lower'].iloc[-1]))
                 
                 # Display data summary
                 with st.expander("Data Summary"):
@@ -455,18 +556,21 @@ if st.sidebar.button("Analyze Stock"):
     except Exception as e:
         logger.error(f"Error analyzing {ticker}: {str(e)}", exc_info=True)
         st.error(f"Error analyzing {ticker}: {str(e)}")
-        st.info("Please check if the ticker symbol is correct and try again.")
+        st.info("Check that the symbol is listed on the selected exchange and try again.")
     
     finally:
         # Display logs in an expander
         with st.expander("Debug Logs", expanded=True):
             st.text(log_buffer.getvalue())
 
+if analysis_mode == "Backtest":
+    render_position_sizer()
+
 # Footer
 st.markdown("---")
 st.markdown("### About")
 st.markdown("""
-This app combines traditional technical analysis with machine learning to provide stock price predictions.
+This app combines technical analysis, machine learning forecasts and walk-forward backtesting for crypto markets.
 - **LSTM Model**: Deep learning model that captures long-term dependencies in time series data
 - **XGBoost Model**: Gradient boosting model that excels at feature-based prediction
 - **Forecast Horizon**: Choose between 1-day and 3-day ahead predictions

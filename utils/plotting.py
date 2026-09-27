@@ -59,7 +59,7 @@ def create_candlestick_plot(df, ticker):
     
     # Update layout with secondary y-axis for RSI
     fig.update_layout(
-        title=f"{ticker} Stock Analysis",
+        title=f"{ticker} Price Analysis",
         xaxis_title="Date",
         yaxis_title="Price ($)",
         yaxis2=dict(
@@ -95,7 +95,7 @@ def create_prediction_figure(
         high=df['High'],
         low=df['Low'],
         close=df['Close'],
-        name='Stock Price'
+        name="Price"
     )
     
     # Create prediction trace
