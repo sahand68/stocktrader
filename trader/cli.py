@@ -8,19 +8,31 @@ import numpy as np
 import pandas as pd
 
 from trader.backtest import Costs
+from trader.compare import skill
 from trader.data import bar_minutes, load_bars, make_exchange, periods_per_year
 from trader.jev import JevOracle
+from trader.openai_decisions import OpenAIOracle
 from trader.paper import KillSwitch, PaperTrader
-from trader.strategies import BuyAndHold, JevDirection, SmaTrend
+from trader.strategies import BuyAndHold, JevDirection, OpenAIDirection, SmaTrend
 from trader.trials import TrialLedger
 from trader.validate import Report, validate
 
-STRATEGIES = ("jev", "sma-trend", "buy-and-hold")
+STRATEGIES = ("jev", "openai-state", "openai-chart", "openai-state-chart", "sma-trend", "buy-and-hold")
+
+
+def default_model(strategy: str) -> str | None:
+    if strategy == "jev":
+        return "jev-latest"
+    if strategy.startswith("openai-"):
+        return "gpt-6-luna"
+    return None
 
 
 def make_strategy(name: str, interval: str, model: str, allow_short: bool):
     if name == "jev":
         return JevDirection(JevOracle(model=model), interval, allow_short=allow_short)
+    if name.startswith("openai-"):
+        return OpenAIDirection(OpenAIOracle(model=model), interval, name.removeprefix("openai-"), allow_short=allow_short)
     if name == "sma-trend":
         return SmaTrend(allow_short=allow_short)
     return BuyAndHold()
@@ -83,6 +95,7 @@ def cmd_fetch(args) -> None:
 
 
 def cmd_backtest(args) -> None:
+    args.model = args.model or default_model(args.strategy)
     bars = load_bars(args.exchange, args.symbol, args.interval, args.days)
     if args.placebo:
         bars = placebo_bars(bars)
@@ -104,14 +117,32 @@ def cmd_backtest(args) -> None:
     )
     print_report(report)
     if isinstance(strategy, JevDirection):
-        o = strategy.oracle
-        print(f"\nJev: {o.calls} new calls, {o.input_tokens:,} input tokens, ${o.cost_usd:.4f}; the rest came from cache")
+        print(f"\n{strategy.oracle.describe_usage()}; the rest came from cache")
 
     args.out.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     path = args.out / f"{args.strategy}_{args.symbol.replace('/', '-')}_{args.interval}_{stamp}.json"
     path.write_text(json.dumps(report.to_dict(), indent=2, default=float))
     print(f"Report: {path}")
+
+
+def cmd_compare(args) -> None:
+    bars = load_bars(args.exchange, args.symbol, args.interval, args.days)
+    edges, usage = {}, []
+    for spec in args.strategies.split(","):
+        name, _, model = spec.strip().partition("@")
+        if name not in STRATEGIES or default_model(name) is None:
+            sys.exit(f"{name!r} is not a model-driven strategy")
+        model = model or default_model(name)
+        strategy = make_strategy(name, args.interval, model, allow_short=False)
+        inputs = strategy.inputs(bars)
+        edges[f"{name}@{model}"] = inputs["p_up"] - inputs["p_down"]
+        usage.append(strategy.oracle.describe_usage())
+
+    table = skill(pd.DataFrame(edges), bars["close"].pct_change().shift(-1))
+    print(f"\nNext-bar skill on {args.symbol} {args.interval}, paired on bars every model answered\n")
+    print(table.to_string(float_format=lambda x: f"{x:.4f}"))
+    print("\n" + "\n".join(usage))
 
 
 def cmd_paper(args) -> None:
@@ -163,12 +194,19 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--fee-bps", type=float, default=10.0, help="per side")
     p.add_argument("--slippage-bps", type=float, default=5.0, help="per side")
     p.add_argument("--allow-short", action="store_true")
-    p.add_argument("--model", default="jev-latest", help="pin a version, e.g. jev-1.13.0, once thresholds matter")
+    p.add_argument("--model", help="default jev-latest for jev, gpt-6-luna for openai-*; "
+                                   "pin a version, e.g. jev-1.13.0, once thresholds matter")
     p.add_argument("--prior-trials", type=int, default=0,
                    help="variations tried on this data outside this tool; understating it only fools you")
     p.add_argument("--placebo", action="store_true", help="run on a random walk with the same volatility; should fail")
     p.add_argument("--out", type=Path, default=Path("reports"))
     p.set_defaults(func=cmd_backtest)
+
+    p = sub.add_parser("compare", help="paired next-bar skill of model-driven strategies, before thresholds and costs")
+    market(p)
+    p.add_argument("--strategies", default="jev,openai-chart",
+                   help="comma list of strategy[@model], e.g. jev@jev-1.13.0,openai-chart@gpt-6-luna")
+    p.set_defaults(func=cmd_compare)
 
     p = sub.add_parser("paper", help="paper trade an approved backtest report on live data")
     p.add_argument("report", type=Path)

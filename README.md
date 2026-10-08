@@ -27,6 +27,20 @@ The state has no prices, dates or symbol. A model trained on market history coul
 
 Answers are cached in `.trader/jev_cache.sqlite`, keyed by model, question and state, so rerunning a backtest costs nothing. At the listed $0.042 per million input tokens, a first run over two years of hourly bars is about 17,000 calls and roughly $0.25. Requests are paced to 1,000 per minute to stay under the account rate limit, so that first run takes about 18 minutes.
 
+## OpenAI Decisions as a challenger
+
+OpenAI's Decisions API answers the same `Choice` question with the same labels, threshold rule, cache and request pacing, so any difference comes from the model and what it sees. It also accepts images, so there are three variants:
+
+| strategy | evidence |
+|---|---|
+| `openai-state` | Jev's JSON state, unchanged |
+| `openai-chart` | a candlestick chart of the last 96 bars with volume, rebased so the last close is 100, no time axis |
+| `openai-state-chart` | both |
+
+All of them answer on exactly the bars Jev answers. The charts pass the same anonymity and look-ahead checks as the state. Refused questions read as no edge, so the strategy stays flat on those bars. Answers are cached in `.trader/openai_cache.sqlite`.
+
+`trader compare` scores models on the next bar before any threshold or cost: hit rate when a model makes a call, rank IC of `p_up - p_down` against the next return, and a paired McNemar test against the first model listed. The cost gate is strict on hourly bars, so this is where a difference in forecasting skill shows up first.
+
 ## The three gates
 
 `trader backtest` approves a strategy only if all three pass:
@@ -43,6 +57,7 @@ Answers are cached in `.trader/jev_cache.sqlite`, keyed by model, question and s
 ```bash
 pip install -e ".[dev]"
 export TYPESAFE_API_KEY=...        # from console.typesafe.ai
+export OPENAI_API_KEY=...          # only for openai-* strategies; the Decisions API is in limited preview
 ```
 
 Market data comes from public exchange endpoints via [ccxt](https://github.com/ccxt/ccxt), so no exchange key is needed. binance.com is geo-blocked in some countries, including the US. Use `--exchange binanceus` or `--exchange coinbaseexchange --symbol BTC/USD` there.
@@ -55,6 +70,9 @@ trader fetch --symbol BTC/USDT --interval 1h --days 730
 trader backtest --strategy jev --symbol BTC/USDT --interval 1h --days 730
 trader backtest --strategy sma-trend          # a baseline Jev has to beat
 trader backtest --strategy jev --placebo      # same pipeline on a random walk; should be rejected
+trader backtest --strategy openai-chart       # the challenger, through the same gates
+
+trader compare --strategies jev@jev-1.13.0,openai-state,openai-chart
 
 trader paper reports/jev_BTC-USDT_1h_<timestamp>.json
 ```
@@ -71,4 +89,4 @@ Pin a Jev version (`--model jev-1.13.0`) once you rely on a threshold. Aliases s
 pytest
 ```
 
-The tests need no network access. Jev calls go through the real `typesafe-sdk` against an in-process mock server, and exchange calls go to a fake ccxt exchange.
+The tests need no network access. Jev and Decisions calls go through the real `typesafe-sdk` and `openai` clients against in-process mock servers, and exchange calls go to a fake ccxt exchange.

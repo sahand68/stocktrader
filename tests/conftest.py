@@ -4,9 +4,11 @@ import httpx2
 import numpy as np
 import pandas as pd
 import pytest
+from openai import AsyncOpenAI
 from typesafe_sdk import AsyncTypeSafeClient, RetryPolicy
 
 from trader.jev import JevOracle
+from trader.openai_decisions import OpenAIOracle
 
 HOUR_MS = 3_600_000
 
@@ -82,6 +84,50 @@ def make_oracle(fake: FakeJev, tmp_path, model: str = "jev-latest") -> JevOracle
 @pytest.fixture
 def oracle(fake_jev, tmp_path):
     return make_oracle(fake_jev, tmp_path)
+
+
+class FakeDecisions:
+    """
+    Stands in for OpenAI's /v1/decisions behind the real SDK. Leans up when the evidence
+    shows a rising last bar, so answers are deterministic and depend on what was sent.
+    Every `refuse_every`-th request is refused.
+    """
+
+    def __init__(self, model: str = "gpt-6-luna-2026-09-29", refuse_every: int | None = None):
+        self.model = model
+        self.refuse_every = refuse_every
+        self.requests: list[dict] = []
+
+    def __call__(self, request: httpx2.Request) -> httpx2.Response:
+        body = json.loads(request.content)
+        self.requests.append(body)
+        usage = {"input_tokens": 900, "output_tokens": 1, "total_tokens": 901,
+                 "input_tokens_details": {"cache_write_tokens": 0, "cached_tokens": 0},
+                 "output_tokens_details": {"reasoning_tokens": 0}}
+        if self.refuse_every and len(self.requests) % self.refuse_every == 0:
+            return httpx2.Response(200, json={"model": self.model, "usage": usage,
+                                              "answers": [{"type": "refusal", "name": "direction"}]})
+        text = "".join(p.get("text", "") for p in body["input"][0]["content"])
+        tilt = 0.2 if '"last_bar": -' not in text else -0.2
+        probs = {"up": 0.4 + tilt, "down": 0.4 - tilt, "unclear": 0.2}
+        best = max(probs, key=probs.get)
+        return httpx2.Response(200, json={"model": self.model, "usage": usage, "answers": [{
+            "type": "choice", "name": "direction", "choice": best, "confidence": 0.5,
+            "probabilities": [{"value": k, "probability": v} for k, v in probs.items()],
+        }]})
+
+
+def make_openai_oracle(fake: FakeDecisions, tmp_path, model: str = "gpt-6-luna") -> OpenAIOracle:
+    return OpenAIOracle(
+        model=model,
+        cache_path=tmp_path / "openai.sqlite",
+        requests_per_minute=1e9,
+        client_factory=lambda: AsyncOpenAI(
+            api_key="test-key", max_retries=0,
+            http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(fake)),
+        ),
+        progress=False,
+    )
 
 
 class FakeExchange:

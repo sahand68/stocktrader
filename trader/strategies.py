@@ -14,6 +14,7 @@ import pandas as pd
 
 from trader.features import build_features, ready
 from trader.jev import LABELS, JevOracle, direction_question, make_state
+from trader.openai_decisions import CHART_BARS, EVIDENCE, OpenAIOracle, chart_window, decision_question
 
 
 class BuyAndHold:
@@ -89,3 +90,36 @@ class JevDirection:
         if self.allow_short:
             pos = np.where(edge < -params["threshold"], -1.0, pos)
         return pd.Series(pos, index=inputs.index)
+
+
+class OpenAIDirection(JevDirection):
+    """
+    JevDirection with OpenAI's Decisions API answering instead. `evidence` picks what it sees:
+    Jev's state ("state"), a chart of the last CHART_BARS bars ("chart"), or both ("state-chart").
+    It answers on exactly the bars Jev does, so the two can be compared bar for bar.
+    """
+
+    def __init__(self, oracle: OpenAIOracle, interval: str, evidence: str = "chart",
+                 thresholds=(0.0, 0.1, 0.2, 0.3, 0.4), allow_short: bool = False):
+        if evidence not in EVIDENCE:
+            raise ValueError(f"evidence must be one of {EVIDENCE}")
+        super().__init__(oracle, interval, thresholds, allow_short)
+        self.name = f"openai-{evidence}"
+        self.evidence = evidence
+        self.question = decision_question(interval, evidence)
+
+    def states(self, bars: pd.DataFrame) -> tuple[pd.Index, list[dict]]:
+        features = build_features(bars)
+        rows = features[ready(features)]
+        assert len(rows) == 0 or bars.index.get_loc(rows.index[0]) >= CHART_BARS - 1
+        ohlc = bars[["open", "high", "low", "close"]].to_numpy()
+        volume = bars["volume"].to_numpy()
+        evidence = []
+        for t, (_, row) in zip(bars.index.get_indexer(rows.index), rows.iterrows()):
+            e = {}
+            if self.evidence != "chart":
+                e["state"] = make_state(row, self.interval)
+            if self.evidence != "state":
+                e["bars"] = chart_window(ohlc, volume, t)
+            evidence.append(e)
+        return rows.index, evidence

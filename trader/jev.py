@@ -111,7 +111,11 @@ class JevOracle:
     Ask Jev about many states concurrently, with a disk cache in front.
 
     client_factory builds the AsyncTypeSafeClient; tests pass one with a mock transport.
+    Subclasses for other decision APIs override `_query` and `key`.
     """
+
+    label = "jev"
+    price_per_million_input_tokens: float | None = PRICE_PER_MILLION_INPUT_TOKENS
 
     def __init__(
         self,
@@ -138,8 +142,14 @@ class JevOracle:
         return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
     @property
-    def cost_usd(self) -> float:
-        return self.input_tokens * PRICE_PER_MILLION_INPUT_TOKENS / 1e6
+    def cost_usd(self) -> float | None:
+        if self.price_per_million_input_tokens is None:
+            return None
+        return self.input_tokens * self.price_per_million_input_tokens / 1e6
+
+    def describe_usage(self) -> str:
+        cost = "" if self.cost_usd is None else f", ${self.cost_usd:.4f}"
+        return f"{self.label}: {self.calls} new calls, {self.input_tokens:,} input tokens{cost}"
 
     def ask(self, question: Choice, states: list[dict]) -> list[Answer]:
         keys = [self.key(question, s) for s in states]
@@ -168,20 +178,24 @@ class JevOracle:
                 async with limit:
                     await wait_turn()
                     started = time.perf_counter()
-                    response = await client.system_one(state=state, questions={"direction": question})
+                    probabilities, model, tokens = await self._query(client, question, state)
                     latency = (time.perf_counter() - started) * 1000
-                answer = response.choices["direction"]
-                tokens = response.usage.input_tokens or 0
-                result = Answer(dict(answer.probabilities), response.model, tokens, latency)
+                result = Answer(probabilities, model, tokens, latency)
                 self.cache.put(key, result)
                 self.calls += 1
                 self.input_tokens += tokens
                 done[key] = result
                 if self.progress and len(done) % max(1, len(states) // 10) == 0:
-                    print(f"  jev: {len(done)}/{len(states)} answered, ${self.cost_usd:.4f}", file=sys.stderr)
+                    print(f"  {self.label}: {len(done)}/{len(states)} answered", file=sys.stderr)
 
             try:
                 await asyncio.gather(*(one(k, s) for k, s in states.items()))
             finally:
                 self.cache.commit()   # keep every answer already paid for, even if a call failed
         return done
+
+    async def _query(self, client, question, state) -> tuple[dict[str, float], str, int]:
+        """One request: (probability per label, versioned model that answered, input tokens)."""
+        response = await client.system_one(state=state, questions={"direction": question})
+        answer = response.choices["direction"]
+        return dict(answer.probabilities), response.model, response.usage.input_tokens or 0
